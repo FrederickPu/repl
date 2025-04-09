@@ -12,6 +12,9 @@ import REPL.Lean.InfoTree
 import REPL.Lean.InfoTree.ToJson
 import REPL.Snapshots
 
+def Array.replicate {α : Type u} (n : Nat) (v : α) : Array α where
+  toList := List.replicate n v
+
 /-!
 # A REPL for Lean.
 
@@ -212,9 +215,10 @@ def runCommand (s : Command) : M IO (CommandResponse ⊕ Error) := do
     cmdContext := (cmdSnapshot?.map fun c => c.cmdContext).getD
       { fileName := "",
         fileMap := default,
-        tacticCache? := none,
         snap? := none,
-        cancelTk? := none } }
+        cancelTk? := none,
+        tacticCache? := none
+       } }
   let env ← recordCommandSnapshot cmdSnapshot
   let jsonTrees := match s.infotree with
   | some "full" => trees
@@ -232,6 +236,108 @@ def runCommand (s : Command) : M IO (CommandResponse ⊕ Error) := do
       sorries,
       tactics
       infotree }
+
+def splitArray {α : Type} (arr : Array α) (n : Nat) : Array (Array α) := Id.run do
+  if n ≤ 0 then #[]
+  else if n = 1 then #[arr]
+  else if arr.size = 0 then Array.replicate n #[]
+  else
+    let baseSize := arr.size / n
+    let remainder := arr.size % n
+
+    let mut result : Array (Array α) := #[]
+    let mut start : Nat := 0
+
+    for i in List.range n do
+      let extraElem := if i < remainder then 1 else 0
+      let endPos := start + baseSize + extraElem
+      let subArray := arr.extract start endPos
+      result := result.push subArray
+      start := start + baseSize + extraElem
+    result
+
+-- #eval splitArray #[1] 4
+
+unsafe def getHeaderEnv (header : String) : IO Command.State := do
+  Lean.initSearchPath (← Lean.findSysroot)
+  enableInitializersExecution
+  let inputCtx   := Parser.mkInputContext header "<input>"
+  let (header, parserState, messages)  ← Parser.parseHeader inputCtx
+  let (env, _) ← processHeader header {} messages inputCtx
+  let commandState := (Command.mkState env messages {})
+  let s ← IO.processCommands inputCtx parserState commandState <&> Frontend.State.commandState
+  pure s
+
+unsafe def batchVerifySequential (commandState : Command.State)  (proofs : Array String) : IO (Array (CommandResponse ⊕ Error)) := do
+  proofs.mapM (fun pf => do
+    let inputCtx   := Parser.mkInputContext pf "<input>"
+    let parserState := { : Parser.ModuleParserState }
+    let (_, msgs, _) ← Lean.Elab.IO.processCommandsWithInfoTrees inputCtx parserState commandState
+    return .inl ({ env := 0,
+                    messages := ← msgs.mapM fun m => Message.of m,
+                    sorries := [],
+                    tactics := [],
+                    infotree := none })
+  )
+
+unsafe def batchVerifyParrallelNaive (header : String) (proofs : Array String) : IO (Array (CommandResponse ⊕ Error)) := do
+  let commandState ← getHeaderEnv header
+  let tasks : Array (Task (Except IO.Error CommandResponse)) ← (proofs.mapM <| fun proof => IO.asTask <| do
+    let inputCtx   := Parser.mkInputContext proof "<input>"
+    let parserState := { : Parser.ModuleParserState }
+    let (_, msgs, _) ← Lean.Elab.IO.processCommandsWithInfoTrees inputCtx parserState commandState
+    return ({ env := 0,
+              messages := ← msgs.mapM fun m => Message.of m,
+              sorries := [],
+              tactics := [],
+              infotree := none
+            })
+  )
+  let result := ← IO.wait <| ← IO.mapTasks (·.mapM (pure ·)) tasks.toList
+  match result with
+  | .ok results =>
+    return (results.map
+      fun x =>
+        match x with
+        | .ok cmdres => .inl cmdres
+        | .error e => .inr (Error.mk e.toString)
+      ).toArray
+  | .error _ => return #[]
+
+unsafe def batchVerifyParrallel (header : String) (proofs : Array String) (buckets : Option Nat): IO (Array (CommandResponse ⊕ Error)) := do
+  let buckets :=
+    match buckets with
+    | some x => x
+    | none => max 50 proofs.size
+  let commandState ← getHeaderEnv header
+  let tasks ← (splitArray proofs buckets |>.mapM <| fun bucket => IO.asTask ( (batchVerifySequential commandState bucket)))
+  let result := ← IO.wait <| ← IO.mapTasks (·.mapM (pure ·)) tasks.toList
+  match result with
+  | .ok results => {
+    let womp : List (Array (CommandResponse ⊕ Error)) ← results.mapM (
+      fun x => do
+        match x with
+        | .ok bucket => pure bucket
+        | .error e =>
+          IO.println e
+          pure #[]
+    )
+    return womp.toArray.flatMap id
+  }
+  | .error _ => return #[]
+
+unsafe def runBatchVerify (batch : BatchVerify) : IO (Array (CommandResponse ⊕ Error)) := do
+  match batch.mode with
+  | some x =>
+    if x = "naive" then do
+      return ← batchVerifyParrallelNaive batch.header batch.proofs
+    if x = "parrallel" then do
+      return ← batchVerifyParrallel batch.header batch.proofs batch.buckets
+  | none =>
+    pure ()
+  let commandState ← getHeaderEnv batch.header
+  batchVerifySequential commandState batch.proofs
+
 
 def processFile (s : File) : M IO (CommandResponse ⊕ Error) := do
   try
@@ -271,6 +377,22 @@ instance [ToJson α] [ToJson β] : ToJson (α ⊕ β) where
   | .inl a => toJson a
   | .inr b => toJson b
 
+
+structure Batch where
+  header : String
+  proofs : Array String
+deriving FromJson, ToJson
+
+
+def parseBatch (query : String) : IO Batch := do
+  let json := Json.parse query
+  match json with
+  | .error e => throw <| IO.userError <| toString <| toJson <|
+      (⟨"Could not parse JSON:\n" ++ e⟩ : Error)
+  | .ok j => match fromJson? j with
+    | .ok (r : Batch) => return r
+    | .error e => throw <| IO.userError <| toString <| toJson <| (⟨"Could not parse JSON batch:\n" ++ e⟩ : Error)
+
 /-- Commands accepted by the REPL. -/
 inductive Input
 | command : REPL.Command → Input
@@ -280,6 +402,7 @@ inductive Input
 | unpickleEnvironment : REPL.UnpickleEnvironment → Input
 | pickleProofSnapshot : REPL.PickleProofState → Input
 | unpickleProofSnapshot : REPL.UnpickleProofState → Input
+| batchVerify : REPL.BatchVerify → Input
 
 /-- Parse a user input string to an input command. -/
 def parse (query : String) : IO Input := do
@@ -299,6 +422,8 @@ def parse (query : String) : IO Input := do
     | .ok (r : REPL.UnpickleProofState) => return .unpickleProofSnapshot r
     | .error _ => match fromJson? j with
     | .ok (r : REPL.Command) => return .command r
+    | .error _ => match fromJson? j with
+    | .ok (r : REPL.BatchVerify) => return .batchVerify r
     | .error _ => match fromJson? j with
     | .ok (r : REPL.File) => return .file r
     | .error e => throw <| IO.userError <| toString <| toJson <|
@@ -320,6 +445,7 @@ where loop : M IO Unit := do
   if query.startsWith "#" || query.startsWith "--" then loop else
   IO.println <| toString <| ← match ← parse query with
   | .command r => return toJson (← runCommand r)
+  | .batchVerify r => return toJson (← runBatchVerify r)
   | .file r => return toJson (← processFile r)
   | .proofStep r => return toJson (← runProofStep r)
   | .pickleEnvironment r => return toJson (← pickleCommandSnapshot r)
@@ -328,6 +454,24 @@ where loop : M IO Unit := do
   | .unpickleProofSnapshot r => return toJson (← unpickleProofSnapshot r)
   printFlush "\n" -- easier to parse the output if there are blank lines
   loop
+
+
+unsafe def testSeqential: M IO Unit := do
+  let query ← getLines
+  let ⟨header, proofs⟩ ← parseBatch query
+  let commandState ← getHeaderEnv header
+  let q ← (batchVerifySequential commandState proofs)
+  for l in q do
+    IO.println (toJson l)
+
+-- #check CommandOptions.mk
+unsafe def testParrallel : IO Unit := do
+  let query ← getLines
+  let ⟨header, proofs⟩ ← parseBatch query
+  let q ← (batchVerifyParrallelNaive header proofs)
+  for l in q do
+    IO.println (toJson l)
+
 
 /-- Main executable function, run as `lake exe repl`. -/
 unsafe def main (_ : List String) : IO Unit := do
