@@ -45,3 +45,19 @@ def processInput (input : String) (cmdState? : Option Command.State)
   | some cmdState => do
     pure ({ : Parser.ModuleParserState }, cmdState)
   processCommandsWithInfoTrees inputCtx parserState commandState
+
+/-
+  asTask but with a timeout
+-/
+def withTimeout {α : Type} (act : IO α) (timeoutMs : Nat) (prio := Task.Priority.default) : IO (Except IO.Error α) := do
+  let task ← IO.asTask act prio
+  let timeoutTask ← do
+      IO.sleep timeoutMs.toUInt32
+      throw <| IO.userError s!"Operation timed out"
+  match ← IO.waitAny [task, timeoutTask] with
+    | .ok a => do
+      IO.cancel timeoutTask
+      return .ok a
+    | .error e =>
+      IO.cancel task
+      throw e
