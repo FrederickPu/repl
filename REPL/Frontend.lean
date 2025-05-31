@@ -51,9 +51,10 @@ def processInput (input : String) (cmdState? : Option Command.State)
 -/
 def withTimeout {α : Type} (act : IO α) (timeoutMs : Nat) (prio := Task.Priority.default) : IO (Except IO.Error α) := do
   let task ← IO.asTask act prio
-  let timeoutTask ← do
+  let timeoutTask ← IO.asTask (do
       IO.sleep timeoutMs.toUInt32
       throw <| IO.userError s!"Operation timed out"
+  )
   match ← IO.waitAny [task, timeoutTask] with
     | .ok a => do
       IO.cancel timeoutTask
