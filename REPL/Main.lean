@@ -293,6 +293,8 @@ def unpickleProofSnapshot (n : UnpickleProofState) : M IO (ProofStepResponse ⊕
 Run a command, returning the id of the new environment, and any messages and sorries.
 -/
 def runCommand (s : Command) : M IO (CommandResponse ⊕ Error) := do
+  Lean.loadDynlib ".lake/packages/Canonical/.lake/build/lib/libcanonical_lean.so"
+  Lean.loadDynlib ".lake/packages/Canonical/.lake/build/lib/libCanonical.so"
   let (cmdSnapshot?, notFound) ← do match s.env with
   | none => pure (none, false)
   | some i => do match (← get).cmdStates[i]? with
